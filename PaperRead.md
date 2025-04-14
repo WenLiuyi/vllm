@@ -531,11 +531,6 @@ def _init_executor(self)->None:
 ### 工作进程`Worker`
 
 
-
-### 块管理器`BlockManager`
-
-### 调度器`Scheduler`
-
 ### 推理引擎`LLMEngine`
 `LLMEngine`是主要的执行引擎，用于处理从客户端接收的请求，执行文本生成任务，并返回生成的结果。该类包括一个tokenizer、一个Language model（可能分布在多个 GPU 上），以及分配给中间状态（即 KV Cache）的 GPU 内存空间。
 
@@ -831,7 +826,7 @@ num_cpu_blocks = max(num_cpu_blocks, 0)
 
 **在确定KV Cache Block的大小后，创建empty tensor，将其先放置到gpu上，实现显存的预分配**。这是如何完成的呢？核心函数：**`_allocate_kv_cache`**
 
-![Image](https://mmbiz.qpic.cn/mmbiz_png/GmyBmIxnRkO6pPZW1EZzxCib9Qua6vWiaEdx8wNPBzPhgQwuQP7D92y7Uq3jM8mjrudKnqTibDgc0goico0QhO1rmw/640?wx_fmt=png&from=appmsg&tp=webp&wxfrom=5&wx_lazy=1&wx_co=1)
+![](image-13.png)
 
 回到`LLMEngine`初始化函数中，调用`_initialize_kv_caches`后，进入：`self.model_executor.initialize_cache(num_gpu_blocks, num_cpu_blocks)`，来看看模型执行器的`initialize_cache`函数：
 
@@ -924,6 +919,73 @@ def _allocate_kv_cache(
 
 
 ### 推理
+#### 序列组`SequenceGroup`
+
+##### 原生输入
+
+##### `SequenceGroup`的作用
+
+1个`SequenceGroup`实例包括："**1个prompt -> 多个outputs**"
+
+**一个seq_group中的所有seq共享1个prompt**
+
+- **其中每组"prompt -> output"组成一个序列（seq，属于Sequence实例），每个seq下有若干状态(status)属性（`class SequenceStatus(enum.IntEnum)`），包括**：
+
+  - `WAITING`：正在waiting队列中（waiting队列中的序列都没有做过prefill）；
+  - `RUNNING`：正在running队列中（即已经开始做推理）；
+  - `SWAPPED`：正在swapped队列中，表示：此时gpu资源不足，相关的seq_group被抢占，导致其暂停推理，相关的KV block被置换到cpu上（swap out）；等待gpu资源充足时再置换回来重新计算（swap in）；
+  - `FINISHED_STOPPED`：正常执行完毕（例如：碰到符号，该seq的推理正常结束）；
+  - `FINISHED_LENGTH_CAPPED`：因为seq的长度达到最大长度限制，而结束推理；
+  - `FINISHED_ABORTED`：因不正常状态，而被终止的推理。例如客户端断开连接，则服务器会终止相关seq的推理；
+  - `FINISHED_IGNORED`：因prompt过长而被终止执行的推理（本质上也是受到长度限制）
+
+  ![](image-11.png)
+
+推理过程如下：
+
+* **推理开始之前**：seq_group下只有1条seq，它就是prompt，状态为waiting；
+
+* **在第1个推理阶段**：调度器选中了这个seq_group，由于它的采样参数中n = 4，所以在做完prefill之后，它会生成4个seq，它们的状态都是running；
+
+* **在若干个推理阶段后，gpu上的资源不够了，这个seq_group不幸被调度器抢占**：它相关的KV block也被swap out到cpu上。此时所有seq的状态变为swapped。注意：当一个seq_group被抢占时，对它的处理有两种方式：
+
+    * `Swap`：如果该seq_group下的seq数量 > 1，此时会采取swap策略，即把**seq_group下所有seq的KV block从gpu上卸载到cpu上**。（seq数量比较多，直接抛弃已计算的KV block，不划算）
+
+    * `Recomputation`：如果该seq_group下的seq数量 = 1，此时采取recomputation策略，即**释放该seq_group相关的物理块，将其重新放回waiting队列中**。等下次它被选中推理时，从prefill阶段开始重新推理。（seq数量少，重新计算KV block的成本不高）
+
+* **又过了若干个推理阶段，gpu上的资源又充足了，此时执行swap in操作**，将卸载到cpu上的KV block重新读到gpu上，继续对该seq_group做推理，此时seq的状态又变为running；
+
+* **又过了若干个推理阶段，该seq_group中有1个seq已经推理完成了，其状态被标记为finish**，此后这条已经完成的seq将不参与调度；
+
+* **又过了若干个推理阶段，这个seq_group下所有的seq都已经完成推理了**，此时可作为最终output返回。
+
+##### `SequenceGroup`结构
+
+![](image-12.png)
+
+* `self.seqs_dict = {seq.seq_id: seq for seq in seqs}`：一个seq_group下包含若干seqs，其中每个seq是一个Sequence对象；
+
+* `self.metrics`：**记录该seq_group相关的指标**
+
+  ```python
+  self.metrics = RequestMetrics(arrival_time=arrival_time,
+                                last_token_time=arrival_time,
+                                first_scheduled_time=None,
+                                first_token_time=None,
+                                time_in_queue=None,
+                                spec_token_acceptance_counts=[0] * draft_size)
+  ```
+
+* `get_max_num_running_steps`：**该seq_group在剩余生命周期内，并行running的最大seq数量。“剩余生命周期”指从此刻一直到seq_group中所有的seq都做完推理**。
+
+    ```python
+    def get_max_num_running_seqs(self) -> int:
+        if self.is_single_seq:
+            return 0 if self.first_seq.is_finished() else 1
+        return self.num_seqs() - self.num_finished_seqs()
+    ```
+    > 1. `num_seqs()`函数：获取符合指定 `status` 状态的所有序列，并返回其长度；
+    > 2. `get_finished_seqs()`：返回已经完成的序列的数量（包括：`FINISHED_STOPPED`, `FINISHED_LENGTH_CAPPED`, `FINISHED_ABORTED`,`FINISHED_IGNORED`共四种状态）
 
 离线批推理中，脚本包括以下两个关键步骤：
 
@@ -1041,8 +1103,10 @@ def generate(
 >     priority=0
 > )
 > ```
->
-> ds
+
+
+当一条请求到来时，流程如下：
+![](image-14.png)
 
 `generate`函数实际上做了两件事情：
 
@@ -1074,10 +1138,10 @@ if isinstance(params, SamplingParams) and params.n > 1:
 ```
 2. **创建序列**：
 ```python
-// 1. 加载block大小，结束符token ID
+# 1. 加载每个KV cache block的大小（默认为16）；
 block_size = self.cache_config.block_size
-seq_id = next(self.seq_counter)
-eos_token_id = self.input_preprocessor.get_eos_token_id(lora_request)
+seq_id = next(self.seq_counter)     # 当前seq的id
+eos_token_id = self.input_preprocessor.get_eos_token_id(lora_request) # 结束符token ID
 
 // 2. input拆分为：编码器、解码器输入
 encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
@@ -1091,7 +1155,9 @@ encoder_seq = (None if encoder_inputs is None else Sequence(
             prompt_adapter_request))
 ```
 
-3. 根据`params`创建`SequenceGroup`：是`SamplingParams`，创建采样序列组；是`PoolingParams`，创建池化序列组。
+3. **每个prompt被包装成一个`SequenceGroup`实例**：
+    
+    根据`params`创建`SequenceGroup`：是`SamplingParams`，创建采样序列组；是`PoolingParams`，创建池化序列组。
 
    >1. `SamplingParams`：调用`_create_sequence_group_with_sampling`函数
    >
@@ -1120,16 +1186,16 @@ encoder_seq = (None if encoder_inputs is None else Sequence(
    >   			self.vllm_config.speculative_config.num_speculative_tokens + 1
    >     # 5.2 创建 SequenceGroup 对象
    >   	seq_group = SequenceGroup(
-   >   		request_id=request_id, 
-   >       seqs=[seq], 
-   >       arrival_time=arrival_time, 
-   >       sampling_params=sampling_params, 
-   >       lora_request=lora_request, 
-   >       trace_headers=trace_headers, 
-   >       prompt_adapter_request=prompt_adapter_request,
+   >   	    request_id=request_id, 
+   >        seqs=[seq], 
+   >        arrival_time=arrival_time, 
+   >        sampling_params=sampling_params, 
+   >        lora_request=lora_request, 
+   >        trace_headers=trace_headers, 
+   >        prompt_adapter_request=prompt_adapter_request,
    >    		encoder_seq=encoder_seq, 
-   >       priority=priority, 
-   >       draft_size=draft_size)
+   >        priority=priority, 
+   >        draft_size=draft_size)
    >   	return seq_group
    >   ```
    >
@@ -1138,59 +1204,77 @@ encoder_seq = (None if encoder_inputs is None else Sequence(
    >
 
 4. **选择最空闲的调度器**，添加序列组：
+```python
+costs = [
+    scheduler.get_num_unfinished_seq_groups()
+    for scheduler in self.scheduler
+]
+min_cost_scheduler = self.scheduler[costs.index(min(costs))]
+min_cost_scheduler.add_seq_group(seq_group)
+```
 
-> 如何定义最空闲的调度器？
+> 1. 如何定义最空闲的调度器？
 >
 > ```python
 > def get_num_unfinished_seq_groups(self) -> int:
 >        return len(self.waiting) + len(self.running) + len(self.swapped);
 > ```
+> 2. `add_seq_group`：将`seq_group`中所有序列，添加进scheduler的`self.waiting`队列中
+> ```python
+> def add_seq_group(self, seq_group: SequenceGroup) -> None:
+>   self.swapped.append(seq_group)
+> ```
 
-#### 序列组`SequenceGroup`
+回到入口函数`generate`，在`_validate_and_add_requests`函数之后，所有的`seq_group`都已经被送入调度器（Scheduler）的`waiting`队列中。
 
-##### 原生输入
+接下来通过`_run_engine`执行推理：在1个推理阶段中，调用一次`step`。
+```python
+def _run_engine(
+        self, *, use_tqdm: bool
+) -> list[Union[RequestOutput, PoolingRequestOutput]]:
+    # 1. 初始化进度条
+    '''...'''
 
-##### `SequenceGroup`的作用
+    # 2. 初始化输出列表和统计变量：
+    # outputs 存储引擎产生的输出；total_in_toks 和 total_out_toks 分别跟踪输入和输出的总 token 数
+    outputs: list[Union[RequestOutput, PoolingRequestOutput]] = []
+    total_in_toks = 0
+    total_out_toks = 0
 
-1个`SequenceGroup`实例包括："**1个prompt -> 多个outputs**"
+    # 3. 处理未完成请求： step()完成1次调度
+    while self.llm_engine.has_unfinished_requests():
+        step_outputs = self.llm_engine.step()
+        # 4. 遍历 step_outputs 中的每个output：如果输出已完成，则将其加入到 outputs 列表中
+        for output in step_outputs:
+            if output.finished:
+                outputs.append(output)
+                if use_tqdm:
+                    if isinstance(output, RequestOutput):
+                        '''...'''
+                    else:
+                        pbar.update(1)
 
-**一个seq_group中的所有seq共享1个prompt**
+    if use_tqdm:
+        pbar.close()
+    # 5. 按照请求 ID 对输出进行排序
+    return sorted(outputs, key=lambda x: int(x.request_id))
+```
 
-- **其中每组"prompt -> output"组成一个序列（seq，属于Sequence实例），每个seq下有若干状态(status)属性（`class SequenceStatus(enum.IntEnum)`），包括**：
+接下来的问题是：`step()`中如何决定送哪些`seq_group`去做推理呢？先来看看调度器的结构。
 
-  - `WAITING`：正在waiting队列中（waiting队列中的序列都没有做过prefill）；
-  - `RUNNING`：正在running队列中（即已经开始做推理）；
-  - `SWAPPED`：正在swapped队列中，表示：此时gpu资源不足，相关的seq_group被抢占，导致其暂停推理，相关的KV block被置换到cpu上（swap out）；等待gpu资源充足时再置换回来重新计算（swap in）；
-  - `FINISHED_STOPPED`：正常执行完毕（例如：碰到符号，该seq的推理正常结束）；
-  - `FINISHED_LENGTH_CAPPED`：因为seq的长度达到最大长度限制，而结束推理；
-  - `FINISHED_ABORTED`：因不正常状态，而被终止的推理。例如客户端断开连接，则服务器会终止相关seq的推理；
-  - `FINISHED_IGNORED`：因prompt过长而被终止执行的推理（本质上也是受到长度限制）
+### 调度器`Scheduler`
+调度器重要属性如下：
+![](image-16.png)
 
-  ![Image](https://mmbiz.qpic.cn/mmbiz_png/GmyBmIxnRkNVb9SV7mjXupu7ibfAtyzaaoq6e9ia7rIT5BtWgxJVe9lZN3scKiaTNvlzwsXQmTA0TWyXq2L77gvJw/640?wx_fmt=png&from=appmsg&tp=webp&wxfrom=5&wx_lazy=1&wx_co=1)
+* `self.waiting, self.running, self.swapped`（双端队列：均通过`Deque[SequenceGroup] = deque()`初始化）：
+    
+    * **waiting队列**：存放所有**尚未开始推理（未经历prefill阶段）或被抢占的seq_group**；初始化时，waiting队列中的seq_group只有一个seq，即原始的prompt；
 
-推理过程如下：
+    * **running队列**：存放**当前正在做推理的seq_group**。更准确地说，它存放的是：**上1个推理阶段被送去推理的所有seq_group**；在开始新一轮推理阶段时，调度器会根据本轮的筛选结果，更新running队列，即决定本轮要送哪些seq_group去做推理；
 
-* **推理开始之前**：seq_group下只有1条seq，它就是prompt，状态为waiting
+    * **swapped队列**：存放**被抢占的seq_group**。若一个seq_group被抢占，调度器会对它执行swap或recomputation操作，分别对应着将它送去swapped队列或waiting队列。
 
-##### `SequenceGroup`结构
-
-![Image](https://mmbiz.qpic.cn/mmbiz_png/GmyBmIxnRkNVb9SV7mjXupu7ibfAtyzaa5cfiaTc1YsoGSHmiadhtQkNv9wNzL324bnrrTQXAzO5AHowibIarLWLPw/640?wx_fmt=png&from=appmsg&tp=webp&wxfrom=5&wx_lazy=1&wx_co=1)
-
-* `self.seqs_dict = {seq.seq_id: seq for seq in seqs}`：一个seq_group下包含若干seqs，其中每个seq是一个Sequence对象；
-
-* `self.metrics`：**记录该seq_group相关的指标**
-
-  ```python
-  self.metrics = RequestMetrics(arrival_time=arrival_time,
-                                last_token_time=arrival_time,
-                                first_scheduled_time=None,
-                                first_token_time=None,
-                                time_in_queue=None,
-                                spec_token_acceptance_counts=[0] * draft_size)
-  ```
-
-* `get_max_num_running_steps`：**该seq_group在剩余生命周期内，并行running的最大seq数量。“剩余生命周期”指从此刻一直到seq_group中所有的seq都做完推理**。
-
+### 块管理器`BlockManager`
 
 
 ## 致谢
@@ -1198,3 +1282,4 @@ encoder_seq = (None if encoder_inputs is None else Sequence(
 部分图转自：
 
 [vllm模型执行笔记: LLMEngine, Executor, Worker, ModelRunner](https://zhuanlan.zhihu.com/p/706685260)
+[图解大模型计算加速系列：vLLM源码解析2，调度器策略(Scheduler)]https://mp.weixin.qq.com/s/UCdqQUM_9a36uXkO36wpSg
