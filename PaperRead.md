@@ -334,12 +334,14 @@ engine_args = EngineArgs(...)
 ```
 2. 创建`LLMEngine`引擎：
 ```python
+# 1. 使用配置好的engine参数，初始化LLMEngine实例
 self.llm_engine = LLMEngine.from_engine_args(
-            engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
-        self.engine_class = type(self.llm_engine)
-
-        self.request_counter = Counter()
-        self.default_sampling_params: Union[dict[str, Any], None] = None
+	engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
+self.engine_class = type(self.llm_engine)
+'''2. 用于全局唯一的request_id：
+在vLLM中内核引擎的处理中，1个prompt视为1个request，分配全局唯一的request_id''' 
+self.request_counter = Counter()
+self.default_sampling_params: Union[dict[str, Any], None] = None
 ```
 
 > 进入`from_engine_args`函数，看看引擎的创建过程：
@@ -367,11 +369,10 @@ self.llm_engine = LLMEngine.from_engine_args(
 >        )
 > ```
 >
-> 1. 引擎配置实例的生成函数：[create_engine_config](https://github.com/vllm-project/vllm/blob/f7030df3be651bbce42932be736129d37caa856b/vllm/engine/arg_utils.py#L1155)：返回一个`VllmConfig`实例
+> 1. 引擎配置实例的生成函数：[create_engine_config](https://github.com/vllm-project/vllm/blob/f7030df3be651bbce42932be736129d37caa856b/vllm/engine/arg_utils.py#L1155)：将EngineArgs分解成ModelConfig，CacheConfig， ParallelConfig和SchedulerConfig，返回一个`VllmConfig`实例；
 > 2. 引擎实例的创建函数：[from_vllm_config](https://github.com/vllm-project/vllm/blob/aa3b3d76e0db63a4214b45805dc9bc3e5609c30e/vllm/engine/llm_engine.py#L491)：（工厂方法）使用传入的 `VllmConfig` 配置对象，创建并返回一个新的 `LLMEngine` 实例。
 
-
-采用同一个推理引擎`LLMEngine`，整体架构如下：
+采用推理引擎`LLMEngine`，整体架构如下：
 ![](image-7.png)
 
 每个推理包含两个阶段：
@@ -379,7 +380,7 @@ self.llm_engine = LLMEngine.from_engine_args(
 * 调度预处理阶段：`Scheduler`决定可参与推理的请求，为每个请求创建：**包含输入tokens的ID的集合**，和**逻辑-物理块映射表**；
 * **Worker并行计算阶段**：将请求的控制信息，分发到各个worker上推理。`Worker`中的`CacheEngine`管理KV Cache；`Worker`中的model加载模型并开展推理。
 
-### 模型执行器
+### 模型执行器`Executor`
 * 首先，**模型执行器的类型是如何指定的呢**？：**`_get_executor_cls`函数**
 
    在创建引擎实例的函数`from_vllm_config`中，有：`executor_class=cls._get_executor_cls(vllm_config),`
@@ -452,7 +453,12 @@ def _init_executor(self) -> None:
    self.collective_rpc("load_model")
 ```
 
+> 工作进程包装器（`WorkerWrapperBase`）：代表一个执行器中的一个进程，延迟初始化worker实例（真正的worker实例在`init_worker`中创建），控制worker的生命周期。
+
+
+
 ##### `ExecutorWithExternalLauncher`的初始化
+
 ```python
 def _init_executor(self) -> None:
    # 1. 验证配置：
@@ -491,6 +497,40 @@ def _init_executor(self) -> None:
 
 ```
 
+##### `RayDistributedExecutor`初始化
+
+* 提供两种优化路径：编译DAG+SPMD / 传统RPC
+* 硬件适配：自动检测TPU（切换通信方式：NCCL转为shm共享内存）
+
+```python
+def _init_executor(self)->None:
+  '''初始化和配置'''
+  # 1. Ray集群初始化
+  initialize_ray_cluster(self.parallel_config)
+  placement_group = self.parallel_config.placement_group
+  
+  # 2. 创建并行的GPU Workers
+  self._init_workers_ray(placement_group)
+  
+  # 3. 消息编解码器
+  self.input_encoder = msgspec.msgpack.Encoder(enc_hook=encode_hook)
+  self.output_decoder = msgspec.msgpack.Decoder(
+        Optional[List[SamplerOutput]])
+```
+
+>  初始化Ray集群（`initialize_ray_cluster`）：负责连接或创建Ray集群，并设置资源分配策略；
+>
+> 初始化工作进程(workers)（`_init_workers_ray`）：创建、配置和管理分布式LLM推理所需的所有工作节点。
+>
+> 1. 在Ray集群中，创建并配置多个工作进程：使用Ray的Placement Group确保GPU资源正确分配；每个worker绑定到特定的资源bundle
+> 1. 分布式通信：单节点使用127.0.0.1优化通信；多节点使用实际IP地址
+> 1. 支持并行模式：流水线并行和张量并行
+
+
+
+### 工作进程`Worker`
+
+
 
 ### 块管理器`BlockManager`
 
@@ -508,12 +548,10 @@ def _init_executor(self) -> None:
 4. **模型执行器**：`self.model_executor = executor_class(vllm_config=vllm_config, )`；
 
    创建继承`ExecutorBase`基类的实例：初始化函数中包括`self._init_executor()`
-   ```python
-   _init_executor
-   ```
 5. **KV Cache初始化**：`self._initialize_kv_caches();`（如果模型的运行类型不是 `pooling`），用于存储推理过程中间结果，减少重复计算；
 6. **使用统计信息**
 7. **创建调度器**：
+   
    ```python
    self.scheduler = [
       Scheduler(
@@ -570,6 +608,7 @@ def _initialize_kv_caches(self) -> None:
 >  ```
 >
 > * `initialize_cache`：通过底层的 worker初始化 KV 缓存
+>     
 >     * 计算**最大并发量**：推理过程中同时处理请求的最大数量。
 >     ```python
 >     # block_size 是每个缓存块的大小；max_model_len 是模型处理的最大序列长度
@@ -581,6 +620,7 @@ def _initialize_kv_caches(self) -> None:
 ###### `Worker`前向推理：`determine_num_available_blocks`
 ![alt text](image-10.png)
 **在模型部署的初始化阶段（推理正式开始前），vLLM通过模拟实验的方式，来决定gpu/cpu上到底有多少个KV cache物理块可分配给后续的请求做推理**。这是如何完成的呢？
+
 ```python
 @torch.inference_mode()
     def determine_num_available_blocks(self) -> Tuple[int, int]:
@@ -788,15 +828,18 @@ num_cpu_blocks = max(num_cpu_blocks, 0)
 > CPU上物理块总数也是同理，但与GPU不同的是，它无需模拟前向推理。CPU上可用的内存总数由用户通过参数传入（默认4G）。
 
 ###### `Worker`初始化 KV Cache：`initialize_cache`
+
+**在确定KV Cache Block的大小后，创建empty tensor，将其先放置到gpu上，实现显存的预分配**。这是如何完成的呢？核心函数：**`_allocate_kv_cache`**
+
+![Image](https://mmbiz.qpic.cn/mmbiz_png/GmyBmIxnRkO6pPZW1EZzxCib9Qua6vWiaEdx8wNPBzPhgQwuQP7D92y7Uq3jM8mjrudKnqTibDgc0goico0QhO1rmw/640?wx_fmt=png&from=appmsg&tp=webp&wxfrom=5&wx_lazy=1&wx_co=1)
+
+回到`LLMEngine`初始化函数中，调用`_initialize_kv_caches`后，进入：`self.model_executor.initialize_cache(num_gpu_blocks, num_cpu_blocks)`，来看看模型执行器的`initialize_cache`函数：
+
 ```python
 def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
       # 1. 验证缓存大小：检查给定的缓存大小（num_gpu_blocks 和 block_size）是否有效；
-        raise_if_cache_size_invalid(
-            num_gpu_blocks, self.cache_config.block_size,
-            self.cache_config.is_attention_free,
-            self.model_config.max_model_len,
-            self.parallel_config.pipeline_parallel_size)
+        raise_if_cache_size_invalid(...)
       # 2. 更新缓存配置：
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
@@ -814,10 +857,204 @@ def initialize_cache(self, num_gpu_blocks: int,
         self._warm_up_model()
 ```
 
+包括两个关键步骤：
 
-包括以下几个关键函数：
+1. `_init_cache_engine()`：创建一个`CacheEngine`对象，并初始化：
 
-### `add_request`：接收用户请求
+   ```python
+   # CacheEngine的初始化函数中，包括：
+   self.gpu_cache = self._allocate_kv_cache(
+               self.num_gpu_blocks, self.device_config.device_type)
+   self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
+   ```
+
+**`_allocate_kv_cache`预分配KV Cache内存：为每个注意力层创建全零初始化的张量**
+
+​	大小为：`(2, num_blocks, block_size, num_kv_heads, head_size)`
+
+```python
+def _allocate_kv_cache(
+	self,
+	num_blocks: int,
+	device: str,
+	) -> List[torch.Tensor]:
+	# 1. 从注意力后端获取合适的缓存张量形状，记为：kv_cache_shape
+	kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+	num_blocks, self.block_size, self.num_kv_heads, self.head_size)
+  # 2. 设置内存锁定选项
+	pin_memory = is_pin_memory_available() if device == "cpu" else False
+  # 3. 逐层分配缓存：为每个注意力层创建全零初始化的张量
+	kv_cache: List[torch.Tensor] = []
+	for _ in range(self.num_attention_layers):
+		layer_kv_cache = torch.zeros(kv_cache_shape,
+                               dtype=self.dtype,
+                               pin_memory=pin_memory,
+                               device=device)
+		kv_cache.append(layer_kv_cache)
+	return kv_cache
+```
+
+2. **模型预热`_warm_up_model`**：
+
+   ```python
+   def _warm_up_model(self) -> None:
+     # 1. 确定预热尺寸：在非eager模式下，过滤掉已被CUDA图捕获的尺寸，避免重复工作
+   	warmup_sizes = self.vllm_config.compilation_config.compile_sizes.copy()
+   	if not self.model_config.enforce_eager:
+   		warmup_sizes = [
+   			x for x in warmup_sizes if x not in
+   			self.vllm_config.compilation_config.cudagraph_capture_sizes
+   		]
+     # 2. 按尺寸降序预热：通过_dummy_run执行虚拟推理，触发内核编译和缓存预热
+   	for size in sorted(warmup_sizes, reverse=True):
+   		logger.info("Compile and warming up model for size %d", size)
+   		self.model_runner._dummy_run(size)
+     # 3. CUDA图捕获：capture_model
+   	if not self.model_config.enforce_eager:
+   		self.model_runner.capture_model(self.gpu_cache)
+   	set_random_seed(self.model_config.seed)
+   ```
+
+   > 调用`capture_model`方法，通过CUDA图捕获模型的计算图：
+   >
+   > 1. 主要支持小批量decoding场景（<=200 tokens)：当批处理的token数量超过200时，CUDA图带来的性能提升不明显；
+   > 2. 需要固定大小的tensor，不支持变长批处理
+   > 3. 使用场景：仅支持decoding request的捕获（每个序列单个token）：不支持prefill request和chunked prefill+decoding
+
+
+
+### 推理
+
+离线批推理中，脚本包括以下两个关键步骤：
+
+1. `llm = LLM(model="facebook/opt-125m")`：实例化一个离线批处理的vLLM对象：LLMEngine执行一次模拟实验（profiling），来判断需要在gpu上预留多少的显存空间给KV Cache block；
+2. `outputs = llm.generate(prompts, sampling_params)`：推理入口
+
+#### 入口函数：`generate`
+
+```python
+def generate(
+	self,
+	prompts: Union[Union[PromptType, Sequence[PromptType]],
+                 Optional[Union[str, list[str]]]] = None,
+  # sampling_params: 采样超参，例如温度、top_k等；如果为None则使用vLLM默认的参数
+	sampling_params: Optional[Union[SamplingParams,	
+                                  Sequence[SamplingParams]]] = None,
+  # prompt_token_ids: prompt对应的token_id，如果没有提供的话，vllm会调用tokenizer进行
+	prompt_token_ids: Optional[Union[list[int], list[list[int]]]] = None,
+	# use_tqdm: 是否要展示process bar
+  use_tqdm: bool = True,
+  # lora_request：如果想请求特定的lora_adapter，可以将它的path等信息包装在该请求中
+	lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
+	# prompt_adapter_request：提示器适配请求
+  prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+  # guided_options_request：引导器解码选项
+	guided_options_request: Optional[Union[LLMGuidedOptions,
+                                         GuidedDecodingRequest]] = None,
+	priority: Optional[list[int]] = None,) -> list[RequestOutput]:
+	runner_type = self.llm_engine.model_config.runner_type
+
+  # 1. 运行器类型验证：确保模型配置支持生成任务
+  if runner_type not in ["generate", "transcription"]:
+    messages = ["...",]
+		supported_runner_types = self.llm_engine.model_config.supported_runner_types
+	if "generate" in supported_runner_types:
+		messages.append("...")
+	raise ValueError(" ".join(messages))
+	# 2. 输入处理：支持直接传入token IDs或文本提示（兼容新旧两种输入格式）
+	if prompt_token_ids is not None:
+		parsed_prompts = self._convert_v1_inputs(
+			prompts=cast(Optional[Union[str, list[str]]], prompts),
+			prompt_token_ids=prompt_token_ids,)
+	else:
+		parsed_prompts = cast(Union[PromptType, Sequence[PromptType]],prompts)
+	# 3. 引导解码处理
+	if isinstance(guided_options_request, dict):
+		if len(guided_options_request) > 1:
+			raise ValueError("...")
+		guided_options_request = GuidedDecodingRequest(**guided_options_request)
+	# 4. 采样参数处理
+	if sampling_params is None:
+		sampling_params = self.get_default_sampling_params()
+	# 5. 请求验证和添加
+	self._validate_and_add_requests(	# 验证并添加所有请求到引擎
+		prompts=parsed_prompts,
+		params=sampling_params,
+		lora_request=lora_request,
+		prompt_adapter_request=prompt_adapter_request,
+		guided_options=guided_options_request,
+		priority=priority)
+	# 6. 执行生成
+	outputs = self._run_engine(use_tqdm=use_tqdm)
+	return self.engine_class.validate_outputs(outputs, RequestOutput)
+```
+
+> `_validate_and_add_requests`函数内：
+>
+> 逐个添加请求到引擎；支持优先级调度（默认优先级为0）
+>
+> ```python
+> for i, prompt in enumerate(prompts):
+> 	self._add_request(
+> 	prompt,
+> 	params[i] if isinstance(params, Sequence) else params,
+> 	lora_request=lora_request[i] if isinstance(
+> 	lora_request, Sequence) else lora_request,
+> 	prompt_adapter_request=prompt_adapter_request,
+> 	priority=priority[i] if priority else 0,
+> )
+> ```
+>
+> `_add_request`函数：
+>
+> ```python
+> def _add_request(
+> 	self,
+> 	prompt: PromptType,
+> 	params: Union[SamplingParams, PoolingParams],
+> 	lora_request: Optional[LoRARequest] = None,
+> 	prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+> 	priority: int = 0,
+> ) -> None:
+> 	request_id = str(next(self.request_counter))	# 使用计数器 request_counter 生成唯一ID
+> 	self.llm_engine.add_request(
+> 		request_id, prompt, params, lora_request=lora_request, prompt_adapter_request=prompt_adapter_request, priority=priority,)
+> ```
+>
+> 调用案例：
+>
+> ```python
+> # 多模态请求示例
+> self._add_request(
+>     prompt={"text": "描述这张图片", "image": image_tensor},
+>     params=SamplingParams(top_p=0.9),
+>     prompt_adapter_request=ClipAdapterRequest()
+> )
+> # 高优先级实时对话
+> self._add_request(
+>     prompt="生成下周会议摘要",params=SamplingParams(temperature=0.3),priority=100
+> )
+> # 低延迟场景
+> self._add_request(
+>     prompt=[token1, token2, token3],  # 预分词
+>     params=PoolingParams(stride=128),  # 池化模式
+>     priority=0
+> )
+> ```
+>
+> ds
+
+`generate`函数实际上做了两件事情：
+
+1. `_add_request`：**将输入数据传给LLMEngine**：
+   * **把每1个prompt包装成一个SequenceGroup对象**：从客户端角度看，1个请求可能包含多个prompts，例如离线批处理场景下，可以将1个batch理解成1个请求；但是**从LLMEngine的角度看，1个prompt是1个请求**，所以它会对输入数据进行预处理；
+   * **把包装成SequenceGroup对象的数据加入调度器（Scheduler）的waiting队列，等待处理**。
+2. `_run_engine`：**执行推理**。只要调度器的waiting/running/swapped队列非空，就认为此时这批batch还没有做完推理，这时会调用LLMEngine的`step()`函数，来完成1次调度以决定要送哪些数据去做推理。
+
+
+
+#### `add_request`：接收用户请求
+
 * 功能：将请求添加到引擎的请求池中，并在调度器的 `engine.step()` 被调用时，处理这些请求。
 
 先做输入有效性检查（`prompt`和`params`不为None；`lora_request`请求出现时，配置中是否启用LoRA；是否支持优先级调度；是否启用引导解码等）；设置请求到达时间（若无，则使用当前时间）；进行分词器验证；使用`input_preprocessor`对传入的 `prompt`、`lora_request` 和 `prompt_adapter_request` 进行预处理，转为适合模型处理的格式。
@@ -856,6 +1093,50 @@ encoder_seq = (None if encoder_inputs is None else Sequence(
 
 3. 根据`params`创建`SequenceGroup`：是`SamplingParams`，创建采样序列组；是`PoolingParams`，创建池化序列组。
 
+   >1. `SamplingParams`：调用`_create_sequence_group_with_sampling`函数
+   >
+   >   ```python
+   >   def _create_sequence_group_with_sampling(
+   >   	self, request_id: str, seq: Sequence, sampling_params: SamplingParams, arrival_time: float, lora_request: Optional[LoRARequest], trace_headers: Optional[Mapping[str, str]] = None, prompt_adapter_request: Optional[PromptAdapterRequest] = None, encoder_seq: Optional[Sequence] = None, priority: int = 0,) -> SequenceGroup:
+   >   	# 1. 验证Logprobs参数
+   >   	max_logprobs = self.get_model_config().max_logprobs
+   >   	if (sampling_params.logprobs
+   >   		and sampling_params.logprobs > max_logprobs) or (
+   >   			sampling_params.prompt_logprobs
+   >   			and sampling_params.prompt_logprobs > max_logprobs):
+   >   		raise ValueError(f"Cannot request more than {max_logprobs} logprobs.")
+   >   	# 2. 构建Logits处理器：用于调整生成过程中的 logits 值
+   >   	sampling_params = self._build_logits_processors(sampling_params, lora_request)
+   >   	# 3. 复制采样参数：对 sampling_params 进行防御性复制（clone），确保在后续操作中不会修改原始的采样参数
+   >   	sampling_params = sampling_params.clone()
+   >     # 4. 更新生成配置
+   >   	sampling_params.update_from_generation_config(
+   >   		self.generation_config_fields, seq.eos_token_id)
+   >   	# 5. 创建序列组：
+   >     # 5.1 确定draft_size：如果配置中启用了推测性解码（speculative_config），则根据推测性解码的配置调整 draft_size
+   >   	draft_size = 1
+   >   	if self.vllm_config.speculative_config is not None:
+   >   		draft_size = \
+   >   			self.vllm_config.speculative_config.num_speculative_tokens + 1
+   >     # 5.2 创建 SequenceGroup 对象
+   >   	seq_group = SequenceGroup(
+   >   		request_id=request_id, 
+   >       seqs=[seq], 
+   >       arrival_time=arrival_time, 
+   >       sampling_params=sampling_params, 
+   >       lora_request=lora_request, 
+   >       trace_headers=trace_headers, 
+   >       prompt_adapter_request=prompt_adapter_request,
+   >    		encoder_seq=encoder_seq, 
+   >       priority=priority, 
+   >       draft_size=draft_size)
+   >   	return seq_group
+   >   ```
+   >
+   >   
+   >
+   >
+
 4. **选择最空闲的调度器**，添加序列组：
 
 > 如何定义最空闲的调度器？
@@ -865,7 +1146,55 @@ encoder_seq = (None if encoder_inputs is None else Sequence(
 >        return len(self.waiting) + len(self.running) + len(self.swapped);
 > ```
 
+#### 序列组`SequenceGroup`
+
+##### 原生输入
+
+##### `SequenceGroup`的作用
+
+1个`SequenceGroup`实例包括："**1个prompt -> 多个outputs**"
+
+**一个seq_group中的所有seq共享1个prompt**
+
+- **其中每组"prompt -> output"组成一个序列（seq，属于Sequence实例），每个seq下有若干状态(status)属性（`class SequenceStatus(enum.IntEnum)`），包括**：
+
+  - `WAITING`：正在waiting队列中（waiting队列中的序列都没有做过prefill）；
+  - `RUNNING`：正在running队列中（即已经开始做推理）；
+  - `SWAPPED`：正在swapped队列中，表示：此时gpu资源不足，相关的seq_group被抢占，导致其暂停推理，相关的KV block被置换到cpu上（swap out）；等待gpu资源充足时再置换回来重新计算（swap in）；
+  - `FINISHED_STOPPED`：正常执行完毕（例如：碰到符号，该seq的推理正常结束）；
+  - `FINISHED_LENGTH_CAPPED`：因为seq的长度达到最大长度限制，而结束推理；
+  - `FINISHED_ABORTED`：因不正常状态，而被终止的推理。例如客户端断开连接，则服务器会终止相关seq的推理；
+  - `FINISHED_IGNORED`：因prompt过长而被终止执行的推理（本质上也是受到长度限制）
+
+  ![Image](https://mmbiz.qpic.cn/mmbiz_png/GmyBmIxnRkNVb9SV7mjXupu7ibfAtyzaaoq6e9ia7rIT5BtWgxJVe9lZN3scKiaTNvlzwsXQmTA0TWyXq2L77gvJw/640?wx_fmt=png&from=appmsg&tp=webp&wxfrom=5&wx_lazy=1&wx_co=1)
+
+推理过程如下：
+
+* **推理开始之前**：seq_group下只有1条seq，它就是prompt，状态为waiting
+
+##### `SequenceGroup`结构
+
+![Image](https://mmbiz.qpic.cn/mmbiz_png/GmyBmIxnRkNVb9SV7mjXupu7ibfAtyzaa5cfiaTc1YsoGSHmiadhtQkNv9wNzL324bnrrTQXAzO5AHowibIarLWLPw/640?wx_fmt=png&from=appmsg&tp=webp&wxfrom=5&wx_lazy=1&wx_co=1)
+
+* `self.seqs_dict = {seq.seq_id: seq for seq in seqs}`：一个seq_group下包含若干seqs，其中每个seq是一个Sequence对象；
+
+* `self.metrics`：**记录该seq_group相关的指标**
+
+  ```python
+  self.metrics = RequestMetrics(arrival_time=arrival_time,
+                                last_token_time=arrival_time,
+                                first_scheduled_time=None,
+                                first_token_time=None,
+                                time_in_queue=None,
+                                spec_token_acceptance_counts=[0] * draft_size)
+  ```
+
+* `get_max_num_running_steps`：**该seq_group在剩余生命周期内，并行running的最大seq数量。“剩余生命周期”指从此刻一直到seq_group中所有的seq都做完推理**。
+
+
+
 ## 致谢
+
 部分图转自：
 
 [vllm模型执行笔记: LLMEngine, Executor, Worker, ModelRunner](https://zhuanlan.zhihu.com/p/706685260)
