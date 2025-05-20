@@ -1274,6 +1274,9 @@ def _run_engine(
 
     * **swapped队列**：存放**被抢占的seq_group**。若一个seq_group被抢占，调度器会对它执行swap或recomputation操作，分别对应着将它送去swapped队列或waiting队列。
 
+
+
+
 ### 块管理器`BlockManager`
 
 
